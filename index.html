@@ -303,21 +303,77 @@ function ci(){
   cur=null;
 }
 
-async function da(){
+// ── JS Detection Engine ───────────────────────────────────────────────────────
+const MITRE_MAP={
+  "LOOKALIKE DOMAIN":"T1566.002 — Spearphishing via Lookalike Domain",
+  "SPOOFED SENDER":"T1566.001 — Sender Spoofing",
+  "CREDENTIAL REQUEST":"T1598 — Phishing for Information",
+  "SUSPICIOUS LINK":"T1566.002 — Spearphishing Link",
+  "BRAND IMPERSONATION":"T1566 — Phishing / Brand Impersonation",
+  "IP AS HOST":"T1071 — Application Layer Protocol Abuse",
+  "PAYMENT REQUEST":"T1657 — Financial Theft",
+};
+const URL_RULES=[
+  {test:u=>!u.startsWith("https://"),score:15,sev:"MEDIUM",type:"PROTOCOL",detail:"HTTP used — connection is not encrypted"},
+  {test:u=>/https?:\/\/\d{1,3}(\.\d{1,3}){3}/.test(u),score:40,sev:"CRITICAL",type:"IP AS HOST",detail:"Raw IP address used instead of a real domain"},
+  {test:u=>/\.(xyz|tk|top|ml|ga|cf|gq|pw|cc|su|icu|cyou|buzz|click|link|vip|life|online|site|website|space|fun|host|uno)(\W|$)/.test(u),score:25,sev:"HIGH",type:"SUSPICIOUS TLD",detail:"High-risk TLD commonly used in phishing"},
+  {test:u=>/(bit\.ly|tinyurl|t\.co|goo\.gl|ow\.ly|is\.gd|rb\.gy|tiny\.cc|cutt\.ly)/.test(u),score:20,sev:"MEDIUM",type:"URL SHORTENER",detail:"Shortener hides the real destination"},
+  {test:u=>/pay[p]a[l1]|pay-pal|g[o0]{2}gle|g00gle|amaz[o0]n|faceb[o0]{2}k|micr[o0]s[o0]ft|app[l1]e-|netfl[i1]x|[i1]nstagram|tw[i1]tter|l[i1]nked[i1]n|y[o0]utube/.test(u.toLowerCase()),score:40,sev:"CRITICAL",type:"LOOKALIKE DOMAIN",detail:"Domain mimics a brand via character substitution"},
+  {test:u=>/\/(login|verify|account|suspend|update|confirm|secure|banking|password|credential|signin|auth|wallet|recover)[\/\?_-]/.test(u.toLowerCase()),score:20,sev:"HIGH",type:"SUSPICIOUS PATH",detail:"Path contains credential-harvesting keywords"},
+  {test:u=>{try{return new URL(u).hostname.split(".").length>4}catch(_){return false}},score:20,sev:"MEDIUM",type:"EXCESS SUBDOMAINS",detail:"4+ subdomains — common evasion technique"},
+  {test:u=>(u.match(/%[0-9a-fA-F]{2}/g)||[]).length>3,score:20,sev:"HIGH",type:"OBFUSCATION",detail:"Multiple encoded characters — possible obfuscation"},
+  {test:u=>u.length>120,score:10,sev:"LOW",type:"LONG URL",detail:"Unusually long URL may hide the destination"},
+  {test:u=>(u.match(/[&?]/g)||[]).length>5,score:10,sev:"LOW",type:"MANY PARAMETERS",detail:"Excessive query params — redirect/tracking attack"},
+  {test:u=>/@/.test(u.replace(/^https?:\/\//,"")),score:35,sev:"HIGH",type:"AT-SIGN IN URL",detail:"@ in URL can redirect to a malicious host"},
+  {test:u=>/(paypal-|amazon-|google-|apple-|microsoft-|netflix-|bank-|secure-)(support|help|verify|login|update|account)/.test(u.toLowerCase()),score:35,sev:"CRITICAL",type:"BRAND IMPERSONATION",detail:"Brand name + action keyword = phishing pattern"},
+];
+const EMAIL_RULES=[
+  {test:e=>(e.match(/urgent|immediately|asap|act now|within 24|expire|suspended|locked|verify now|action required|limited time/gi)||[]).length,spm:12,max:40,sev:"HIGH",type:"URGENCY LANGUAGE",detail:n=>`${n} urgency phrase${n>1?"s":""} detected`},
+  {test:e=>(e.match(/password|credit card|ssn|social security|cvv|pin number|bank account|verify your|confirm your identity|billing info/gi)||[]).length,spm:20,max:40,sev:"CRITICAL",type:"CREDENTIAL REQUEST",detail:n=>`${n} credential-harvesting phrase${n>1?"s":""} found`},
+  {test:e=>(e.match(/https?:\/\/[^\s)>"]+/g)||[]).filter(u=>/\.xyz|\.tk|\.top|\.ml|paypa1|g00gle|amaz0n|login\.|verify\./i.test(u)).length,spm:30,max:60,sev:"CRITICAL",type:"SUSPICIOUS LINK",detail:n=>`${n} high-risk URL${n>1?"s":""} embedded in body`},
+  {test:e=>(e.match(/paypal|amazon|google|apple|microsoft|netflix|facebook|instagram|twitter|linkedin|bank of america|wells fargo|chase bank|irs|tax refund/gi)||[]).length,spm:8,max:24,sev:"MEDIUM",type:"BRAND MENTION",detail:n=>`${n} brand${n>1?"s":""} mentioned — verify sender domain`},
+  {test:e=>/dear (customer|user|valued|account holder|member|client)/i.test(e)?1:0,spm:10,max:10,sev:"LOW",type:"GENERIC GREETING",detail:()=>"Generic greeting instead of your real name"},
+  {test:e=>{const m=e.match(/from:\s*([^\n<]+)?<([^>]+)>/i);if(!m)return 0;const name=(m[1]||"").toLowerCase(),dom=(m[2]||"").split("@")[1]?.toLowerCase()||"";return["paypal","google","amazon","apple","microsoft"].some(b=>name.includes(b)&&!dom.includes(b))?1:0},spm:45,max:45,sev:"CRITICAL",type:"SPOOFED SENDER",detail:()=>"Display name claims brand but domain doesn't match"},
+  {test:e=>(e.match(/transfer|wire|payment|send money|gift card|itunes|google play|zelle|venmo|western union/gi)||[]).length,spm:15,max:30,sev:"HIGH",type:"PAYMENT REQUEST",detail:n=>`${n} financial keyword${n>1?"s":""} found`},
+  {test:e=>(e.match(/will be (closed|deleted|suspended|terminated|blocked)|legal action|lawsuit|report to|arrest|penalty|fine of/gi)||[]).length,spm:15,max:30,sev:"HIGH",type:"THREAT LANGUAGE",detail:n=>`${n} threat phrase${n>1?"s":""} detected`},
+];
+function getVerdict(s){return s>=75?"CRITICAL":s>=55?"HIGH":s>=35?"MEDIUM":s>=15?"LOW":"SAFE"}
+function getSimple(v,m){
+  return{SAFE:`This ${m} looks safe. No suspicious patterns detected.`,LOW:"Minor concerns. Verify the source before proceeding.",MEDIUM:"Suspicious. Avoid interacting unless verified.",HIGH:"Likely malicious. Do not click or respond.",CRITICAL:"DANGER: Confirmed threat. Do not open. Report immediately."}[v]||"";
+}
+function getAction(v){
+  return{SAFE:"No action needed. Appears legitimate.",LOW:"Verify the source independently before proceeding.",MEDIUM:"Do not click. Report to your security team.",HIGH:"Block immediately. Escalate to L2. Log in SIEM.",CRITICAL:"CRITICAL: Block, quarantine, file incident report now."}[v]||"";
+}
+function runURL(url){
+  const hits=[];let score=0;
+  for(const r of URL_RULES){try{if(r.test(url)){score=Math.min(score+r.score,100);hits.push({type:r.type,detail:r.detail,sev:r.sev});}}catch(_){}}
+  const v=getVerdict(score);
+  return{verdict:v,score,mode:"URL",input:url,indicators:hits,mitre:MITRE_MAP[hits[0]?.type]||null,simple:getSimple(v,"URL"),action:getAction(v),summary:hits.length?`${hits.length} indicator${hits.length>1?"s":""} detected.`:"No threat indicators found.",ts:new Date().toLocaleString("en-IN")};
+}
+function runEmail(text){
+  const hits=[];let score=0;
+  for(const r of EMAIL_RULES){try{const n=r.test(text);if(n>0){score=Math.min(score+Math.min(n*r.spm,r.max),100);hits.push({type:r.type,detail:r.detail(n),sev:r.sev});}}catch(_){}}
+  const v=getVerdict(score);
+  const mt=hits.find(h=>MITRE_MAP[h.type])?.type;
+  return{verdict:v,score,mode:"EMAIL",input:text.slice(0,100),indicators:hits,mitre:MITRE_MAP[mt]||null,simple:getSimple(v,"email"),action:getAction(v),summary:hits.length?`${hits.length} indicator${hits.length>1?"s":""} detected.`:"No phishing indicators found.",ts:new Date().toLocaleString("en-IN")};
+}
+
+function da(){
   const inp=mode==="URL"?document.getElementById("uf").value.trim():document.getElementById("ef").value.trim();
   if(!inp){alert("Please paste a URL or email first.");return;}
   const btn=document.getElementById("ab");
   btn.disabled=true;btn.textContent="⟩ Scanning…";
-  try{
-    const r=await fetch("/analyze",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({mode,input:inp})});
-    const d=await r.json();
-    cur=d;lvl="SIMPLE";
-    hist.unshift(d);
-    if(hist.length>50)hist=hist.slice(0,50);
-    localStorage.setItem("stryx-h",JSON.stringify(hist));
-    unc();rr(d);
-  }catch(e){alert("Analysis failed. Please try again.");}
-  finally{btn.disabled=false;btn.textContent=`⟩ Analyze ${mode}`;}
+  setTimeout(()=>{
+    try{
+      const d=mode==="URL"?runURL(inp):runEmail(inp);
+      cur=d;lvl="SIMPLE";
+      hist.unshift(d);
+      if(hist.length>50)hist=hist.slice(0,50);
+      localStorage.setItem("stryx-h",JSON.stringify(hist));
+      unc();rr(d);
+    }catch(e){alert("Analysis failed. Please try again.");}
+    finally{btn.disabled=false;btn.textContent=`⟩ Analyze ${mode}`;}
+  },600);
 }
 
 function rr(r){
@@ -474,4 +530,4 @@ function unc(){
 unc();
 </script>
 </body>
-  </html>
+</html>
